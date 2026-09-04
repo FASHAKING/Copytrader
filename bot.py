@@ -431,8 +431,20 @@ class MultiUserCABot:
                             logger.info(f"CA forwarded for user {user_id}: {ca[:20]}... to {matching_route['target_name']}")
 
                     if trading_link:
+                        # Suppress the separate link forward when it adds nothing:
+                        # the link is the same URL the CA was extracted from, or
+                        # the CA itself is embedded in the link. The CA message
+                        # already carries ca_source_url, so the info isn't lost.
+                        link_is_redundant = bool(
+                            ca and (
+                                (ca_source_url and trading_link == ca_source_url) or
+                                ca.lower() in trading_link.lower()
+                            )
+                        )
                         if url_is_duplicate:
                             print(f"🔄 Duplicate URL for user {user_id} on route {route_id}: {trading_link}")
+                        elif link_is_redundant:
+                            print(f"↩️ Skipping redundant link for user {user_id} on route {route_id} (already in CA message)")
                         elif not self.db.can_forward_ca(user_id):
                             print(f"⚠️ User {user_id} hit daily limit")
                         else:
