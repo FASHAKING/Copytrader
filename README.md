@@ -48,8 +48,8 @@ the service. Use the same database path to retain existing data.
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/Firestorm0609/VultMirror.git
-   cd VultMirror
+   git clone https://github.com/FASHAKING/Copytrader.git
+   cd Copytrader
    ```
 
 2. **Install dependencies**
