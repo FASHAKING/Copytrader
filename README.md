@@ -21,7 +21,30 @@ Monitor Solana contract addresses from ANY Telegram channel and instantly forwar
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
 - Your Telegram User ID
 
-### Installation
+### One-command Linux VPS setup (recommended)
+
+From the repository directory, run:
+
+```bash
+bash setup.sh
+```
+
+The setup asks for your bot token and Telegram admin user ID, creates an isolated
+`.venv`, installs dependencies, writes a private `.env`, initializes the database,
+and can install and start a `systemd` service. It never prints your bot token.
+
+After accepting the service prompt, manage the bot with:
+
+```bash
+sudo systemctl status vultmirror
+sudo journalctl -u vultmirror -f
+sudo systemctl restart vultmirror
+```
+
+To update the bot later, pull the changes, run `bash setup.sh` again, and restart
+the service. Use the same database path to retain existing data.
+
+### Manual installation
 
 1. **Clone the repository**
    ```bash
