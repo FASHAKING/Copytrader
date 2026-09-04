@@ -32,6 +32,10 @@ class SessionManager:
         Returns: (success: bool, message: str)
         """
         try:
+            # Clean up any stale pending auth from a previous attempt so
+            # retries don't stack multiple clients on the same session file
+            await self.cleanup_pending_auth(user_id)
+            
             session_path = f"{self.session_dir}/user_{user_id}"
             
             # Create client
@@ -47,6 +51,12 @@ class SessionManager:
             
             # Send code request and STORE the phone_code_hash
             sent_code = await client.send_code_request(phone)
+            
+            # Log where Telegram says it's delivering the code (app vs SMS vs call)
+            # so non-delivery issues can be diagnosed from the console
+            delivery = type(sent_code.type).__name__ if sent_code.type else "unknown"
+            next_delivery = type(sent_code.next_type).__name__ if sent_code.next_type else None
+            print(f"📨 Code requested for user {user_id}: delivery={delivery}, next={next_delivery}")
             
             # Store pending auth data including the hash
             self.pending_auth[user_id] = {

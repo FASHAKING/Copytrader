@@ -12,7 +12,7 @@ import os
 import asyncio
 import hashlib
 from datetime import datetime
-from typing import Dict, Set, Optional
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from io import BytesIO
 
@@ -49,6 +49,14 @@ IGNORE_ADDRESSES = {
     'So11111111111111111111111111111111111111112',
 }
 IGNORE_PREFIXES = ['bafk', 'Qm']
+
+# EVM (Ethereum/L2) contract detection — 0x + 40 hex chars
+EVM_CA_PATTERN = r'0x[a-fA-F0-9]{40}'
+EVM_IGNORE_ADDRESSES = {
+    '0x0000000000000000000000000000000000000000',
+    '0x000000000000000000000000000000000000dead',
+    '0x4200000000000000000000000000000000000042',
+}
 
 # Minimum length for verification codes
 MIN_VERIFICATION_CODE_LENGTH = 5
@@ -135,6 +143,9 @@ class MultiUserCABot:
         if not text:
             return None
         
+        # Remove EVM addresses first — hex chars are also valid base58,
+        # so a 0x address could otherwise be misread as a Solana CA
+        text = re.sub(EVM_CA_PATTERN, '', text)
         potential_addresses = re.findall(SOLANA_CA_PATTERN, text)
         if not potential_addresses:
             return None
@@ -169,10 +180,11 @@ class MultiUserCABot:
         
         # Regex patterns for trading platforms
         link_patterns = [
-            r'https?://(?:www\.)?dexscreener\.com/solana/[A-Za-z0-9]+',
+            r'https?://(?:www\.)?dexscreener\.com/[A-Za-z0-9]+/[A-Za-z0-9]+',
             r'https?://(?:www\.)?pump\.fun/(?:coin/)?[A-Za-z0-9]+',
             r'https?://(?:www\.)?birdeye\.so/token/[A-Za-z0-9]+(?:\?[^\s]*)?',
             r'https?://(?:www\.)?dextools\.io/app/[^\s]+',
+            r'https?://(?:www\.)?gmgn\.ai/[a-z0-9]+/token/[^\s]+',
         ]
         
         for pattern in link_patterns:
@@ -181,6 +193,132 @@ class MultiUserCABot:
                 return match.group(0)
         
         return None
+    
+    # ==================== HIDDEN SOURCE EXTRACTION ====================
+    
+    def extract_hidden_urls(self, message) -> List[str]:
+        """
+        Collect URLs from places the plain text doesn't show:
+          - hyperlink entities (normal-looking text that hides a link)
+          - inline keyboard buttons ("Buy", "Chart" buttons)
+          - the link preview
+        
+        Alert channels often embed the CA in these instead of the text.
+        """
+        urls: List[str] = []
+        
+        # 1. Hyperlink entities — displayed text differs from the actual URL
+        try:
+            for entity, _ in message.get_entities_text():
+                url = getattr(entity, 'url', None)
+                if url:
+                    urls.append(url)
+        except Exception:
+            pass
+        
+        # 2. Inline keyboard buttons (e.g. "Buy on <dex>", "Chart")
+        markup = getattr(message, 'reply_markup', None)
+        rows = getattr(markup, 'rows', None)
+        if rows:
+            for row in rows:
+                for button in getattr(row, 'buttons', None) or []:
+                    url = getattr(button, 'url', None)
+                    if url:
+                        urls.append(url)
+        
+        # 3. Link preview (web page attached to a URL in the text)
+        preview_url = getattr(getattr(message, 'web_preview', None), 'url', None)
+        if preview_url:
+            urls.append(preview_url)
+        
+        # Dedupe, preserving order
+        seen = set()
+        return [u for u in urls if not (u in seen or seen.add(u))]
+    
+    def is_valid_evm_address(self, address: str) -> bool:
+        """Validate an EVM contract address (0x + 40 hex chars)"""
+        if address.lower() in EVM_IGNORE_ADDRESSES:
+            return False
+        return bool(re.fullmatch(EVM_CA_PATTERN, address))
+    
+    def extract_evm_cas(self, text: str) -> Optional[str]:
+        """Extract an EVM contract address posted directly in the text.
+        Addresses inside URLs don't count as standalone."""
+        if not text:
+            return None
+        without_urls = re.sub(r'https?://\S+', '', text)
+        for candidate in re.findall(EVM_CA_PATTERN, without_urls):
+            if self.is_valid_evm_address(candidate):
+                return candidate
+        return None
+    
+    def extract_ca_from_url(self, url: str) -> Optional[str]:
+        """
+        Extract a token contract embedded inside a URL (path or query
+        params) — Solana base58 or EVM 0x addresses.
+        e.g. https://longxyz.com/swap?token=<CA>,
+             https://gmgn.ai/robinhood/token/scout_0xabc...
+        """
+        if not url:
+            return None
+        # Strip EVM addresses for the Solana scan only, so hex runs can't
+        # match as Solana CAs; the EVM scan needs the original URL
+        url_no_evm = re.sub(EVM_CA_PATTERN, '', url)
+        for candidate in re.findall(SOLANA_CA_PATTERN, url_no_evm):
+            if self.is_valid_solana_address(candidate):
+                return candidate
+        for candidate in re.findall(EVM_CA_PATTERN, url):
+            if self.is_valid_evm_address(candidate):
+                return candidate
+        return None
+    
+    def _resolve_ca_and_link(self, message, message_text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Resolve (ca, trading_link, ca_source_url) for a message.
+        
+        Plain text is authoritative when it has a CA. When the text has
+        nothing (common for alert-channel posts), scan the hidden sources —
+        buttons, hyperlink entities, link previews — where these channels
+        actually embed the token address.
+        """
+        ca = self.extract_solana_cas(message_text) or self.extract_evm_cas(message_text)
+        trading_link = self.extract_trading_links(message_text)
+        ca_source_url: Optional[str] = None
+        
+        if ca and trading_link:
+            return ca, trading_link, ca_source_url
+        
+        for url in self.extract_hidden_urls(message):
+            if not trading_link:
+                matched = self.extract_trading_links(url)
+                if matched:
+                    trading_link = matched
+            # dexscreener/dextools URLs carry the PAIR address, not the
+            # token mint — never claim it as the CA
+            if not ca and 'dexscreener' not in url and 'dextools' not in url:
+                ca = self.extract_ca_from_url(url)
+                if ca:
+                    ca_source_url = url
+            if ca and trading_link:
+                break
+        
+        # Last resort: trading bots often put the mint in the callback data
+        # of their Buy/Chart buttons (invisible 64-byte payload, not a URL)
+        if not ca:
+            markup = getattr(message, 'reply_markup', None)
+            for row in getattr(markup, 'rows', None) or []:
+                for button in getattr(row, 'buttons', None) or []:
+                    data = getattr(button, 'data', None)
+                    if data:
+                        data_str = data.decode() if isinstance(data, (bytes, bytearray)) else str(data)
+                        ca = self.extract_ca_from_url(data_str)
+                        if ca:
+                            ca_source_url = None
+                            break
+                if ca:
+                    break
+        
+        return ca, trading_link, ca_source_url
     
     # ==================== MESSAGE HANDLING ====================
     
@@ -213,10 +351,25 @@ class MultiUserCABot:
             # Count forwards for this message across all routes
             forward_count = 0
 
-            # Try to extract CA first
-            ca = self.extract_solana_cas(message_text)
-            # Try to extract trading link
-            trading_link = self.extract_trading_links(message_text)
+            # Extract CA / trading link — plain text first, then hidden
+            # sources (buttons, hyperlinks, previews) that alert channels
+            # use when they don't put the CA directly in the text
+            ca, trading_link, ca_source_url = self._resolve_ca_and_link(event.message, message_text)
+            
+            # Diagnostic: when a route matched but nothing was extracted,
+            # show what hidden sources exist so new channel formats can be
+            # identified from the console
+            if not ca and not trading_link:
+                hidden = self.extract_hidden_urls(event.message)
+                btn_data = []
+                for row in getattr(getattr(event.message, 'reply_markup', None), 'rows', None) or []:
+                    for btn in getattr(row, 'buttons', None) or []:
+                        d = getattr(btn, 'data', None)
+                        if d:
+                            btn_data.append(d.decode() if isinstance(d, (bytes, bytearray)) else str(d))
+                if hidden or btn_data:
+                    print(f"🔍 No CA/link for user {user_id} but hidden sources found: urls={hidden[:3]} btn_data={btn_data[:3]}")
+            
             url_hash = hashlib.sha256(trading_link.encode()).hexdigest() if trading_link else None
 
             def _escape_md(text: str) -> str:
@@ -257,6 +410,8 @@ class MultiUserCABot:
                             else:
                                 ca_message = f"💎 *New CA Detected!*\n\n"
                                 ca_message += f"`{ca}`\n\n"
+                                if ca_source_url:
+                                    ca_message += f"🔗 {_escape_md(ca_source_url)}\n\n"
                                 ca_message += f"📥 From: {_escape_md(matching_route['source_name'])}\n"
                                 ca_message += f"👤 Posted by: {_escape_md(sender_name)}\n"
                                 ca_message += f"⏰ {datetime.now().strftime('%H:%M:%S')}"
